@@ -3324,7 +3324,7 @@ namespace
 				const char* t1 = il2cpp_type_get_name(il2cpp_method_get_param(mi, 1));
 				return t0 && t1 && strcmp(t0, "System.String") == 0 && strcmp(t1, "System.Boolean") == 0;
 			});
-			if (m) TMP_Text_SetText_addr = reinterpret_cast<uintptr_t>(m->methodPointer);
+   			if (m) TMP_Text_SetText_addr = (uintptr_t)m->methodPointer;
 		}
 		const auto UITextMeshProUGUI_Awake_addr = il2cpp_symbols::get_method_pointer(
 			"PRISM.Legacy.dll", "ENTERPRISE.UI",
