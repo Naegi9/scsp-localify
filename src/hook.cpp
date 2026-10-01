@@ -1745,6 +1745,98 @@ namespace
 	// Drama (Ver.2) stories: subtitles live in DramaSubtitlePlayableBehaviour.text on the timeline.
 	// When a Drama scene initializes, translate every subtitle line in place via local2.json
 	// (untranslated lines are dumped to local2.json when dumpUntransLocal2 is on).
+	// ---- Drama subtitle helpers ----
+	static int g_dramaTranslated = 0, g_dramaMissed = 0;
+
+	// Translate DramaSubtitlePlayableBehaviour.text in place (each behaviour object only once).
+	void translateDramaBehaviour(void* behaviour) {
+		if (!behaviour) return;
+		static std::unordered_set<void*> done;
+		if (done.find(behaviour) != done.end()) return;
+		done.insert(behaviour);
+		static auto behaviourClass = il2cpp_symbols::get_class("PRISM.Interactions.Drama.dll", "PRISM.Interactions.Drama", "DramaSubtitlePlayableBehaviour");
+		static auto textField = behaviourClass ? il2cpp_symbols_logged::il2cpp_class_get_field_from_name(behaviourClass, "text") : nullptr;
+		if (!textField) return;
+		auto text = il2cpp_symbols::read_field<Il2CppString*>(behaviour, textField);
+		if (!text) return;
+		std::string newTrans("");
+		if (SCLocal::getGameUnlocalTrans(std::wstring(text->start_char), &newTrans)) {
+			auto newStr = il2cpp_string_new(newTrans.c_str());
+			il2cpp_field_set_value(behaviour, textField, &newStr);
+			g_dramaTranslated++;
+		}
+		else {
+			g_dramaMissed++;
+		}
+	}
+
+	// Find an instance field of type DramaSubtitlePlayableBehaviour on obj (searching base classes too).
+	void* findDramaBehaviourIn(void* obj) {
+		if (!obj) return nullptr;
+		static const auto ga = GetModuleHandleW(L"GameAssembly.dll");
+		static const auto p_class_get_fields = reinterpret_cast<void* (*)(void*, void**)>(GetProcAddress(ga, "il2cpp_class_get_fields"));
+		static const auto p_field_get_type = reinterpret_cast<const Il2CppType* (*)(void*)>(GetProcAddress(ga, "il2cpp_field_get_type"));
+		static const auto p_class_get_parent = reinterpret_cast<void* (*)(void*)>(GetProcAddress(ga, "il2cpp_class_get_parent"));
+		if (!p_class_get_fields || !p_field_get_type || !p_class_get_parent) return nullptr;
+		for (auto klass = il2cpp_symbols::get_class_from_instance(obj); klass; klass = p_class_get_parent(klass)) {
+			void* iter = nullptr;
+			void* f = nullptr;
+			while ((f = p_class_get_fields(klass, &iter)) != nullptr) {
+				const char* tn = il2cpp_type_get_name(p_field_get_type(f));
+				if (tn && strcmp(tn, "PRISM.Interactions.Drama.DramaSubtitlePlayableBehaviour") == 0) {
+					return il2cpp_symbols::read_field(obj, reinterpret_cast<FieldInfo*>(f));
+				}
+			}
+		}
+		return nullptr;
+	}
+
+	// Called by the timeline for the active subtitle clip.
+	HOOK_ORIG_TYPE DramaSubtitleMixerBehaviour_Apply_orig;
+	void DramaSubtitleMixerBehaviour_Apply_hook(void* _this, void* clip, double time) {
+		static bool announced = false;
+		if (!announced) { announced = true; printf("[Drama] subtitle Apply hook active\n"); }
+		try {
+			static auto TimelineClip_get_asset = reinterpret_cast<void* (*)(void*)>(
+				il2cpp_symbols::get_method_pointer("Unity.Timeline.dll", "UnityEngine.Timeline", "TimelineClip", "get_asset", 0));
+			if (clip && TimelineClip_get_asset) {
+				const int before = g_dramaTranslated + g_dramaMissed;
+				translateDramaBehaviour(findDramaBehaviourIn(TimelineClip_get_asset(clip)));
+				if (g_dramaTranslated + g_dramaMissed != before) {
+					printf("[Drama] lines so far: %d translated, %d untranslated\n", g_dramaTranslated, g_dramaMissed);
+				}
+			}
+		}
+		catch (std::exception& e) {
+			printf("[Drama] Apply error: %s\n", e.what());
+		}
+		HOOK_CAST_CALL(void, DramaSubtitleMixerBehaviour_Apply)(_this, clip, time);
+	}
+
+	// Scene setup: translate every subtitle line up front via the initializer result.
+	HOOK_ORIG_TYPE DramaSceneHandler_Initialize_orig;
+	void DramaSceneHandler_Initialize_hook(void* _this, void* result) {
+		try {
+			static auto resultClass = il2cpp_symbols::get_class("PRISM.Interactions.Drama.dll", "PRISM.Interactions.Drama", "DramaSceneInitializerResult");
+			static auto arrField = resultClass ? il2cpp_symbols_logged::il2cpp_class_get_field_from_name(resultClass, "<SubtitleOperateDataArray>k__BackingField") : nullptr;
+			static auto dataClass = il2cpp_symbols::get_class("PRISM.Interactions.Drama.dll", "PRISM.Interactions.Drama", "DramaSubtitleOperateData");
+			static auto behaviourField = dataClass ? il2cpp_symbols_logged::il2cpp_class_get_field_from_name(dataClass, "behaviour") : nullptr;
+			if (result && arrField && behaviourField) {
+				auto arr = il2cpp_symbols::read_field<Il2CppArraySize*>(result, arrField);
+				if (arr) {
+					for (il2cpp_array_size_t i = 0; i < arr->max_length; i++) {
+						if (arr->vector[i]) translateDramaBehaviour(il2cpp_symbols::read_field(arr->vector[i], behaviourField));
+					}
+					printf("[Drama] scene start: %u subtitle lines (%d translated, %d untranslated)\n", (unsigned)arr->max_length, g_dramaTranslated, g_dramaMissed);
+				}
+			}
+		}
+		catch (std::exception& e) {
+			printf("[Drama] scene init error: %s\n", e.what());
+		}
+		HOOK_CAST_CALL(void, DramaSceneHandler_Initialize)(_this, result);
+	}
+
 	HOOK_ORIG_TYPE DramaSceneOperationHandler_Initialize_orig;
 	void DramaSceneOperationHandler_Initialize_hook(void* _this, Il2CppArraySize* subtitles, void* skipMarkers, void* finishMarkers) {
 		try {
@@ -3366,6 +3458,14 @@ namespace
 			"PRISM.Interactions.Drama.dll", "PRISM.Interactions.Drama",
 			"DramaSceneOperationHandler", "Initialize", 3
 		);
+		const auto DramaSubtitleMixerBehaviour_Apply_addr = il2cpp_symbols::get_method_pointer(
+			"PRISM.Interactions.Drama.dll", "PRISM.Interactions.Drama",
+			"DramaSubtitleMixerBehaviour", "Apply", 2
+		);
+		const auto DramaSceneHandler_Initialize_addr = il2cpp_symbols::get_method_pointer(
+			"PRISM.Interactions.Drama.dll", "PRISM.Interactions.Drama",
+			"DramaSceneHandler", "Initialize", 1
+		);
 		const auto UITextMeshProUGUI_Awake_addr = il2cpp_symbols::get_method_pointer(
 			"PRISM.Legacy.dll", "ENTERPRISE.UI",
 			"UITextMeshProUGUI", "Awake", 0
@@ -3718,6 +3818,18 @@ namespace
 		ADD_HOOK(Unity_set_rotation, "Unity_set_rotation at %p");
 
 		ADD_HOOK(TMP_Text_set_text, "TMP_Text_set_text at %p");
+		if (DramaSubtitleMixerBehaviour_Apply_addr) {
+			ADD_HOOK(DramaSubtitleMixerBehaviour_Apply, "DramaSubtitleMixerBehaviour_Apply at %p");
+		}
+		else {
+			printf("DramaSubtitleMixerBehaviour.Apply not found\n");
+		}
+		if (DramaSceneHandler_Initialize_addr) {
+			ADD_HOOK(DramaSceneHandler_Initialize, "DramaSceneHandler_Initialize at %p");
+		}
+		else {
+			printf("DramaSceneHandler.Initialize not found\n");
+		}
 		if (DramaSceneOperationHandler_Initialize_addr) {
 			ADD_HOOK(DramaSceneOperationHandler_Initialize, "DramaSceneOperationHandler_Initialize at %p");
 		}
