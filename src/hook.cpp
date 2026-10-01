@@ -1750,8 +1750,8 @@ namespace
 		try {
 			static auto operateDataClass = il2cpp_symbols::get_class("PRISM.Interactions.Drama.dll", "PRISM.Interactions.Drama", "DramaSubtitleOperateData");
 			static auto behaviourClass = il2cpp_symbols::get_class("PRISM.Interactions.Drama.dll", "PRISM.Interactions.Drama", "DramaSubtitlePlayableBehaviour");
-			static auto behaviourField = operateDataClass ? il2cpp_symbols::il2cpp_class_get_field_from_name(operateDataClass, "behaviour") : nullptr;
-			static auto textField = behaviourClass ? il2cpp_symbols::il2cpp_class_get_field_from_name(behaviourClass, "text") : nullptr;
+			static auto behaviourField = operateDataClass ? il2cpp_symbols_logged::il2cpp_class_get_field_from_name(operateDataClass, "behaviour") : nullptr;
+			static auto textField = behaviourClass ? il2cpp_symbols_logged::il2cpp_class_get_field_from_name(behaviourClass, "text") : nullptr;
 			if (subtitles && behaviourField && textField) {
 				int total = 0, translated = 0;
 				for (il2cpp_array_size_t i = 0; i < subtitles->max_length; i++) {
