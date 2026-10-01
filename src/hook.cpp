@@ -1704,29 +1704,41 @@ namespace
 		return HOOK_CAST_CALL(void, TimelineController_SetLyric)(_this, il2cpp_string_new(newText.c_str()));
 	}
 
-HOOK_ORIG_TYPE TMP_Text_set_text_orig;
-	void TMP_Text_set_text_hook(void* _this, Il2CppString* value) {
-		// Translate text that is set at runtime (e.g. story subtitles) via local2.json.
-		// Only Japanese text is looked up, and each missing line is dumped once per session.
-		if (value) {
-			const std::wstring orig(value->start_char);
-			bool hasJp = false;
-			for (const auto c : orig) {
-				if ((c >= 0x3040 && c <= 0x30FF) || (c >= 0x4E00 && c <= 0x9FFF)) { hasJp = true; break; }
-			}
-			static std::unordered_set<std::wstring> missingSeen;
-			if (hasJp && missingSeen.find(orig) == missingSeen.end()) {
-				std::string newTrans("");
-				if (SCLocal::getGameUnlocalTrans(orig, &newTrans)) {
-					value = il2cpp_string_new(newTrans.c_str());
-				}
-				else {
-					missingSeen.insert(orig);
-				}
-			}
+	// Translate runtime-set Japanese text (e.g. Drama story subtitles) via local2.json.
+	// Each missing line is dumped once per session (when dumpUntransLocal2 is on).
+	void translateRuntimeText(Il2CppString*& value, const char* tag) {
+		if (!value) return;
+		const std::wstring orig(value->start_char);
+		bool hasJp = false;
+		for (const auto c : orig) {
+			if ((c >= 0x3040 && c <= 0x30FF) || (c >= 0x4E00 && c <= 0x9FFF)) { hasJp = true; break; }
 		}
+		if (!hasJp) return;
+		static std::unordered_set<std::wstring> missingSeen;
+		if (missingSeen.find(orig) != missingSeen.end()) return;
+		std::string newTrans("");
+		if (SCLocal::getGameUnlocalTrans(orig, &newTrans)) {
+			value = il2cpp_string_new(newTrans.c_str());
+		}
+		else {
+			missingSeen.insert(orig);
+			printf("[TL miss via %s] %zu chars\n", tag, orig.size());
+		}
+	}
+
+	HOOK_ORIG_TYPE TMP_Text_set_text_orig;
+	void TMP_Text_set_text_hook(void* _this, Il2CppString* value) {
+		translateRuntimeText(value, "set_text");
 		HOOK_CAST_CALL(void, TMP_Text_set_text)(
 			_this, value
+			);
+	}
+
+	HOOK_ORIG_TYPE TMP_Text_SetText_orig;
+	void TMP_Text_SetText_hook(void* _this, Il2CppString* value, bool syncTextInputBox) {
+		translateRuntimeText(value, "SetText");
+		HOOK_CAST_CALL(void, TMP_Text_SetText)(
+			_this, value, syncTextInputBox
 			);
 	}
 
@@ -3303,6 +3315,17 @@ HOOK_ORIG_TYPE TMP_Text_set_text_orig;
 			"Unity.TextMeshPro.dll", "TMPro",
 			"TMP_Text", "set_text", 1
 		);
+		uintptr_t TMP_Text_SetText_addr = 0;
+		{
+			const auto m = il2cpp_symbols::find_method("Unity.TextMeshPro.dll", "TMPro", "TMP_Text", [](const MethodInfo* mi) {
+				if (strcmp(il2cpp_method_get_name(mi), "SetText") != 0) return false;
+				if (il2cpp_method_get_param_count(mi) != 2) return false;
+				const char* t0 = il2cpp_type_get_name(il2cpp_method_get_param(mi, 0));
+				const char* t1 = il2cpp_type_get_name(il2cpp_method_get_param(mi, 1));
+				return t0 && t1 && strcmp(t0, "System.String") == 0 && strcmp(t1, "System.Boolean") == 0;
+			});
+			if (m) TMP_Text_SetText_addr = reinterpret_cast<uintptr_t>(m->methodPointer);
+		}
 		const auto UITextMeshProUGUI_Awake_addr = il2cpp_symbols::get_method_pointer(
 			"PRISM.Legacy.dll", "ENTERPRISE.UI",
 			"UITextMeshProUGUI", "Awake", 0
@@ -3655,6 +3678,12 @@ HOOK_ORIG_TYPE TMP_Text_set_text_orig;
 		ADD_HOOK(Unity_set_rotation, "Unity_set_rotation at %p");
 
 		ADD_HOOK(TMP_Text_set_text, "TMP_Text_set_text at %p");
+		if (TMP_Text_SetText_addr) {
+			ADD_HOOK(TMP_Text_SetText, "TMP_Text_SetText at %p");
+		}
+		else {
+			printf("TMP_Text_SetText(string, bool) not found\n");
+		}
 		ADD_HOOK(UITextMeshProUGUI_Awake, "UITextMeshProUGUI_Awake at %p");
 		ADD_HOOK(ScenarioManager_Init, "ScenarioManager_Init at %p");
 		ADD_HOOK(DataFile_GetBytes, "DataFile_GetBytes at %p");
@@ -3731,6 +3760,11 @@ HOOK_ORIG_TYPE TMP_Text_set_text_orig;
 			std::filesystem::create_directories("dumps");
 			std::ofstream out("dumps/class_dump.txt");
 			static const std::regex re("Drama|Subtitle|Telop|Caption|Serif|Message|Talk|Scenario|Story|Voice|Line", std::regex::icase);
+			static const std::regex fieldRe("DramaSubtitle|Sujigaki|StoryLogCellViewModelDrama|DramaSceneInitializer", std::regex::icase);
+			const auto ga = GetModuleHandleW(L"GameAssembly.dll");
+			const auto p_class_get_fields = reinterpret_cast<void* (*)(void*, void**)>(GetProcAddress(ga, "il2cpp_class_get_fields"));
+			const auto p_field_get_name = reinterpret_cast<const char* (*)(void*)>(GetProcAddress(ga, "il2cpp_field_get_name"));
+			const auto p_field_get_type = reinterpret_cast<const Il2CppType* (*)(void*)>(GetProcAddress(ga, "il2cpp_field_get_type"));
 			size_t asmCount = 0;
 			const auto assemblies = il2cpp_domain_get_assemblies(il2cpp_domain_get(), &asmCount);
 			for (size_t a = 0; a < asmCount; a++) {
@@ -3743,6 +3777,15 @@ HOOK_ORIG_TYPE TMP_Text_set_text_orig;
 					if (!cname || !std::regex_search(cname, re)) continue;
 					const char* ns = il2cpp_class_get_namespace(klass);
 					out << imgName << " | " << (ns ? ns : "") << "." << cname << "\n";
+					if (p_class_get_fields && p_field_get_name && p_field_get_type && std::regex_search(cname, fieldRe)) {
+						void* fiter = nullptr;
+						void* f = nullptr;
+						while ((f = p_class_get_fields(klass, &fiter)) != nullptr) {
+							const char* fn = p_field_get_name(f);
+							const char* ftn = il2cpp_type_get_name(p_field_get_type(f));
+							out << "    [field] " << (ftn ? ftn : "?") << " " << (fn ? fn : "?") << "\n";
+						}
+					}
 					void* iter = nullptr;
 					MethodInfo* m = nullptr;
 					while ((m = il2cpp_class_get_methods(klass, &iter)) != nullptr) {
@@ -3762,6 +3805,7 @@ HOOK_ORIG_TYPE TMP_Text_set_text_orig;
 		catch (std::exception& e) {
 			printf("Class dump failed: %s\n", e.what());
 		}
+
 	}
 }
 
