@@ -1742,6 +1742,42 @@ namespace
 			);
 	}
 
+	// Drama (Ver.2) stories: subtitles live in DramaSubtitlePlayableBehaviour.text on the timeline.
+	// When a Drama scene initializes, translate every subtitle line in place via local2.json
+	// (untranslated lines are dumped to local2.json when dumpUntransLocal2 is on).
+	HOOK_ORIG_TYPE DramaSceneOperationHandler_Initialize_orig;
+	void DramaSceneOperationHandler_Initialize_hook(void* _this, Il2CppArraySize* subtitles, void* skipMarkers, void* finishMarkers) {
+		try {
+			static auto operateDataClass = il2cpp_symbols::get_class("PRISM.Interactions.Drama.dll", "PRISM.Interactions.Drama", "DramaSubtitleOperateData");
+			static auto behaviourClass = il2cpp_symbols::get_class("PRISM.Interactions.Drama.dll", "PRISM.Interactions.Drama", "DramaSubtitlePlayableBehaviour");
+			static auto behaviourField = operateDataClass ? il2cpp_symbols::il2cpp_class_get_field_from_name(operateDataClass, "behaviour") : nullptr;
+			static auto textField = behaviourClass ? il2cpp_symbols::il2cpp_class_get_field_from_name(behaviourClass, "text") : nullptr;
+			if (subtitles && behaviourField && textField) {
+				int total = 0, translated = 0;
+				for (il2cpp_array_size_t i = 0; i < subtitles->max_length; i++) {
+					auto data = subtitles->vector[i];
+					if (!data) continue;
+					auto behaviour = il2cpp_symbols::read_field(data, behaviourField);
+					if (!behaviour) continue;
+					auto text = il2cpp_symbols::read_field<Il2CppString*>(behaviour, textField);
+					if (!text) continue;
+					total++;
+					std::string newTrans("");
+					if (SCLocal::getGameUnlocalTrans(std::wstring(text->start_char), &newTrans)) {
+						auto newStr = il2cpp_string_new(newTrans.c_str());
+						il2cpp_field_set_value(behaviour, textField, &newStr);  // il2cpp expects a pointer to the reference
+						translated++;
+					}
+				}
+				printf("[Drama] %d subtitle lines, %d translated\n", total, translated);
+			}
+		}
+		catch (std::exception& e) {
+			printf("[Drama] subtitle translation error: %s\n", e.what());
+		}
+		HOOK_CAST_CALL(void, DramaSceneOperationHandler_Initialize)(_this, subtitles, skipMarkers, finishMarkers);
+	}
+
 	bool get_NeedsLocalization_func(void* instanceUITextMeshProUGUI) {
 		return false;
 		/*
@@ -3324,8 +3360,12 @@ namespace
 				const char* t1 = il2cpp_type_get_name(il2cpp_method_get_param(mi, 1));
 				return t0 && t1 && strcmp(t0, "System.String") == 0 && strcmp(t1, "System.Boolean") == 0;
 			});
-   			if (m) TMP_Text_SetText_addr = (uintptr_t)m->methodPointer;
+			if (m) TMP_Text_SetText_addr = (uintptr_t)m->methodPointer;
 		}
+		const auto DramaSceneOperationHandler_Initialize_addr = il2cpp_symbols::get_method_pointer(
+			"PRISM.Interactions.Drama.dll", "PRISM.Interactions.Drama",
+			"DramaSceneOperationHandler", "Initialize", 3
+		);
 		const auto UITextMeshProUGUI_Awake_addr = il2cpp_symbols::get_method_pointer(
 			"PRISM.Legacy.dll", "ENTERPRISE.UI",
 			"UITextMeshProUGUI", "Awake", 0
@@ -3678,6 +3718,12 @@ namespace
 		ADD_HOOK(Unity_set_rotation, "Unity_set_rotation at %p");
 
 		ADD_HOOK(TMP_Text_set_text, "TMP_Text_set_text at %p");
+		if (DramaSceneOperationHandler_Initialize_addr) {
+			ADD_HOOK(DramaSceneOperationHandler_Initialize, "DramaSceneOperationHandler_Initialize at %p");
+		}
+		else {
+			printf("DramaSceneOperationHandler.Initialize not found\n");
+		}
 		if (TMP_Text_SetText_addr) {
 			ADD_HOOK(TMP_Text_SetText, "TMP_Text_SetText at %p");
 		}
