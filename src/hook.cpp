@@ -1762,7 +1762,20 @@ namespace
 		std::string newTrans("");
 		if (SCLocal::getGameUnlocalTrans(std::wstring(text->start_char), &newTrans)) {
 			auto newStr = il2cpp_string_new(newTrans.c_str());
-			il2cpp_field_set_value(behaviour, textField, &newStr);
+			il2cpp_gchandle_new(newStr, false);  // keep the new string alive for the whole session
+			// Store the reference directly into the field slot (with GC write barrier when available).
+			static const auto wbarrier = reinterpret_cast<void (*)(void*, void**, void*)>(
+				GetProcAddress(GetModuleHandleW(L"GameAssembly.dll"), "il2cpp_gc_wbarrier_set_field"));
+			auto slot = reinterpret_cast<void**>(reinterpret_cast<char*>(behaviour) + textField->offset);
+			if (wbarrier) wbarrier(behaviour, slot, newStr);
+			else *slot = newStr;
+			static int verifyPrints = 0;
+			if (verifyPrints < 3) {
+				verifyPrints++;
+				auto check = il2cpp_symbols::read_field<Il2CppString*>(behaviour, textField);
+				printf("[Drama] write check: %s, old len %d, new len %d (wbarrier %s)\n",
+					check == newStr ? "ok" : "MISMATCH", text->length, check ? check->length : -1, wbarrier ? "yes" : "no");
+			}
 			g_dramaTranslated++;
 		}
 		else {
@@ -1801,7 +1814,22 @@ namespace
 				il2cpp_symbols::get_method_pointer("Unity.Timeline.dll", "UnityEngine.Timeline", "TimelineClip", "get_asset", 0));
 			if (clip && TimelineClip_get_asset) {
 				const int before = g_dramaTranslated + g_dramaMissed;
-				translateDramaBehaviour(findDramaBehaviourIn(TimelineClip_get_asset(clip)));
+				auto behaviour = findDramaBehaviourIn(TimelineClip_get_asset(clip));
+				translateDramaBehaviour(behaviour);
+				static void* lastBehaviour = nullptr;
+				static int applyPrints = 0;
+				if (behaviour && behaviour != lastBehaviour && applyPrints < 5) {
+					lastBehaviour = behaviour;
+					applyPrints++;
+					static auto bClass = il2cpp_symbols::get_class("PRISM.Interactions.Drama.dll", "PRISM.Interactions.Drama", "DramaSubtitlePlayableBehaviour");
+					static auto tField = bClass ? il2cpp_symbols_logged::il2cpp_class_get_field_from_name(bClass, "text") : nullptr;
+					auto t = tField ? il2cpp_symbols::read_field<Il2CppString*>(behaviour, tField) : nullptr;
+					printf("[Drama] showing line: behaviour %p, text len %d\n", behaviour, t ? t->length : -1);
+				}
+				else if (!behaviour && applyPrints < 5) {
+					applyPrints++;
+					printf("[Drama] Apply: no behaviour found on clip asset\n");
+				}
 				if (g_dramaTranslated + g_dramaMissed != before) {
 					printf("[Drama] lines so far: %d translated, %d untranslated\n", g_dramaTranslated, g_dramaMissed);
 				}
