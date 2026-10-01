@@ -1707,47 +1707,6 @@ namespace
 		return HOOK_CAST_CALL(void, TimelineController_SetLyric)(_this, il2cpp_string_new(newText.c_str()));
 	}
 
-	// Translate runtime-set Japanese text (e.g. Drama story subtitles) via local2.json.
-	// Each missing line is dumped once per session (when dumpUntransLocal2 is on).
-	void translateRuntimeText(Il2CppString*& value, const char* tag) {
-		if (!value) return;
-		const std::wstring orig(value->start_char);
-		bool hasJp = false;
-		for (const auto c : orig) {
-			if ((c >= 0x3040 && c <= 0x30FF) || (c >= 0x4E00 && c <= 0x9FFF)) { hasJp = true; break; }
-		}
-		if (!hasJp) return;
-		static std::unordered_set<std::wstring> missingSeen;
-		if (missingSeen.find(orig) != missingSeen.end()) return;
-		std::string newTrans("");
-		if (SCLocal::getGameUnlocalTrans(orig, &newTrans)) {
-			value = il2cpp_string_new(newTrans.c_str());
-		}
-		else {
-			missingSeen.insert(orig);
-			printf("[TL miss via %s] %zu chars\n", tag, orig.size());
-		}
-	}
-
-	HOOK_ORIG_TYPE TMP_Text_set_text_orig;
-	void TMP_Text_set_text_hook(void* _this, Il2CppString* value) {
-		translateRuntimeText(value, "set_text");
-		HOOK_CAST_CALL(void, TMP_Text_set_text)(
-			_this, value
-			);
-	}
-
-	HOOK_ORIG_TYPE TMP_Text_SetText_orig;
-	void TMP_Text_SetText_hook(void* _this, Il2CppString* value, bool syncTextInputBox) {
-		translateRuntimeText(value, "SetText");
-		HOOK_CAST_CALL(void, TMP_Text_SetText)(
-			_this, value, syncTextInputBox
-			);
-	}
-
-	// Drama (Ver.2) stories: subtitles live in DramaSubtitlePlayableBehaviour.text on the timeline.
-	// When a Drama scene initializes, translate every subtitle line in place via local2.json
-	// (untranslated lines are dumped to local2.json when dumpUntransLocal2 is on).
 	// ======================= Live translation (OpenRouter) =======================
 	// Config file: scsp_localify/live_translate.json
 	//   { "enabled": true, "apiKey": "sk-or-...", "model": "google/gemini-2.5-flash", "waitSeconds": 15 }
@@ -1769,6 +1728,7 @@ namespace
 			std::string apiKey;
 			std::string model = "google/gemini-2.5-flash";
 			int waitSeconds = 15;
+			bool translateUI = true;
 		};
 
 		Config& cfg() {
@@ -1784,6 +1744,7 @@ namespace
 						c.apiKey = j.value("apiKey", std::string());
 						c.model = j.value("model", c.model);
 						c.waitSeconds = j.value("waitSeconds", c.waitSeconds);
+						c.translateUI = j.value("translateUI", c.translateUI);
 					}
 				}
 				catch (std::exception& e) {
@@ -1793,7 +1754,7 @@ namespace
 					printf("[LiveTL] enabled but apiKey is empty - disabling\n");
 					c.enabled = false;
 				}
-				printf("[LiveTL] %s (model: %s)\n", c.enabled ? "enabled" : "disabled", c.model.c_str());
+				printf("[LiveTL] %s (model: %s, UI text: %s)\n", c.enabled ? "enabled" : "disabled", c.model.c_str(), c.translateUI ? "on" : "off");
 			}
 			return c;
 		}
@@ -1801,6 +1762,16 @@ namespace
 		std::mutex mtx;
 		std::vector<std::pair<std::string, std::string>> ready;  // orig utf8 -> translation utf8
 		std::unordered_set<std::string> inFlight;
+
+		const char* kUIPrompt = R"(You translate Japanese UI text from THE iDOLM@STER Shiny Colors: Song for Prism (an idol game) into natural English.
+Input is a JSON object of id -> Japanese text: menu labels, buttons, popups, tutorial and advice messages.
+Return ONLY a JSON object with the exact same ids -> English text. No commentary, no code fences.
+Rules:
+- Keep it short and natural; UI space is limited. Tutorial/advice lines are spoken by the assistant Hazuki to the player ("Producer").
+- Keep \n line breaks roughly where they are.
+- Keep markup exactly as-is: <...> tags and placeholders like {0}. Never add < > or { } that are not in the source.
+- Fixed terms: プリズムジュエル=Prism Jewel, マニー=Money, 星のかけら=Star Shards, プロデュース=Produce, プロデューサー=Producer, ガシャ=Gacha, シーズン=Season, 週目=Week, Pアイドル=P-Idol, Sキャラ=S-Chara.
+- Japanese names in Western order, romanized (e.g. Mano Sakuragi).)";
 
 		const char* kSystemPrompt = R"(You translate Japanese dialogue from THE iDOLM@STER Shiny Colors: Song for Prism into natural English.
 Input is a JSON object of id -> Japanese line. The lines are consecutive subtitles from ONE story scene, in order.
@@ -1836,7 +1807,7 @@ Rules:
 		}
 
 		// Runs on a worker thread: no il2cpp calls here.
-		void translateBatch(const std::vector<std::string>& lines) {
+		void translateBatch(const std::vector<std::string>& lines, bool ui) {
 			nlohmann::json batch = nlohmann::json::object();
 			for (size_t i = 0; i < lines.size(); i++) batch[std::to_string(i)] = lines[i];
 			nlohmann::json body = {
@@ -1844,7 +1815,7 @@ Rules:
 				{"temperature", 0.2},
 				{"response_format", {{"type", "json_object"}}},
 				{"messages", nlohmann::json::array({
-					{{"role", "system"}, {"content", kSystemPrompt}},
+					{{"role", "system"}, {"content", ui ? kUIPrompt : kSystemPrompt}},
 					{{"role", "user"}, {"content", batch.dump(-1, ' ', false)}}
 				})}
 			};
@@ -1883,7 +1854,7 @@ Rules:
 		}
 
 		// Start translating lines in the background. Returns a future that completes when all batches finish.
-		std::shared_future<void> request(const std::vector<std::string>& linesIn) {
+		std::shared_future<void> request(const std::vector<std::string>& linesIn, bool ui = false) {
 			std::vector<std::string> lines;
 			{
 				std::lock_guard<std::mutex> lock(mtx);
@@ -1892,11 +1863,11 @@ Rules:
 				}
 			}
 			if (lines.empty()) return {};
-			printf("[LiveTL] translating %zu new lines with %s...\n", lines.size(), cfg().model.c_str());
-			auto task = std::make_shared<std::packaged_task<void()>>([lines]() {
-				const size_t chunk = 80;
+			printf("[LiveTL] translating %zu new %s with %s...\n", lines.size(), ui ? "UI lines" : "story lines", cfg().model.c_str());
+			auto task = std::make_shared<std::packaged_task<void()>>([lines, ui]() {
+				const size_t chunk = ui ? 40 : 80;
 				for (size_t i = 0; i < lines.size(); i += chunk) {
-					translateBatch(std::vector<std::string>(lines.begin() + i, lines.begin() + std::min(lines.size(), i + chunk)));
+					translateBatch(std::vector<std::string>(lines.begin() + i, lines.begin() + std::min(lines.size(), i + chunk)), ui);
 				}
 			});
 			std::shared_future<void> fut = task->get_future().share();
@@ -1916,8 +1887,78 @@ Rules:
 			g_liveGeneration++;
 			printf("[LiveTL] %zu new lines saved to local2.json\n", got.size());
 		}
+
+		// Runtime UI text: collect misses and send them in batches (main thread only).
+		std::vector<std::string> uiPending;
+		std::unordered_set<std::string> uiQueued;  // never queue the same text twice per session
+		std::chrono::steady_clock::time_point uiFirst;
+
+		void queueUI(const std::string& s) {
+			if (!cfg().enabled || !cfg().translateUI) return;
+			if (s.empty() || s.size() > 3000) return;
+			if (!uiQueued.insert(s).second) return;
+			if (uiPending.empty()) uiFirst = std::chrono::steady_clock::now();
+			uiPending.push_back(s);
+		}
+
+		// Called every frame on the main thread.
+		void tick() {
+			drainReady();
+			if (uiPending.empty()) return;
+			if (uiPending.size() >= 60 || std::chrono::steady_clock::now() - uiFirst > std::chrono::seconds(3)) {
+				std::vector<std::string> batch;
+				batch.swap(uiPending);
+				request(batch, true);
+			}
+		}
 	}
 
+	// Translate runtime-set Japanese text (e.g. Drama story subtitles) via local2.json.
+	// Each missing line is dumped once per session (when dumpUntransLocal2 is on).
+	void translateRuntimeText(Il2CppString*& value, const char* tag) {
+		if (!value) return;
+		const std::wstring orig(value->start_char);
+		bool hasJp = false;
+		for (const auto c : orig) {
+			if ((c >= 0x3040 && c <= 0x30FF) || (c >= 0x4E00 && c <= 0x9FFF)) { hasJp = true; break; }
+		}
+		if (!hasJp) return;
+		static std::unordered_set<std::wstring> missingSeen;
+		static int seenGeneration = 0;
+		if (seenGeneration != g_liveGeneration) {  // new translations arrived: look everything up again
+			seenGeneration = g_liveGeneration;
+			missingSeen.clear();
+		}
+		if (missingSeen.find(orig) != missingSeen.end()) return;
+		std::string newTrans("");
+		if (SCLocal::getGameUnlocalTrans(orig, &newTrans)) {
+			value = il2cpp_string_new(newTrans.c_str());
+		}
+		else {
+			missingSeen.insert(orig);
+			LiveTL::queueUI(utility::conversions::to_utf8string(orig));
+		}
+	}
+
+	HOOK_ORIG_TYPE TMP_Text_set_text_orig;
+	void TMP_Text_set_text_hook(void* _this, Il2CppString* value) {
+		translateRuntimeText(value, "set_text");
+		HOOK_CAST_CALL(void, TMP_Text_set_text)(
+			_this, value
+			);
+	}
+
+	HOOK_ORIG_TYPE TMP_Text_SetText_orig;
+	void TMP_Text_SetText_hook(void* _this, Il2CppString* value, bool syncTextInputBox) {
+		translateRuntimeText(value, "SetText");
+		HOOK_CAST_CALL(void, TMP_Text_SetText)(
+			_this, value, syncTextInputBox
+			);
+	}
+
+	// Drama (Ver.2) stories: subtitles live in DramaSubtitlePlayableBehaviour.text on the timeline.
+	// When a Drama scene initializes, translate every subtitle line in place via local2.json
+	// (untranslated lines are dumped to local2.json when dumpUntransLocal2 is on).
 	// ======================= Drama (Ver.2) subtitle translation =======================
 	static int g_dramaTranslated = 0, g_dramaMissed = 0;
 	static std::unordered_set<void*> g_dramaDone;            // behaviours already translated
@@ -2639,6 +2680,12 @@ Rules:
 
 	HOOK_ORIG_TYPE MainThreadDispatcher_LateUpdate_orig;
 	void MainThreadDispatcher_LateUpdate_hook(void* _this, void* method) {
+		try {
+			LiveTL::tick();
+		}
+		catch (std::exception& e) {
+			printf("[LiveTL] tick error: %s\n", e.what());
+		}
 		try {
 			auto it = mainThreadTasks.begin();
 			while (it != mainThreadTasks.end()) {
