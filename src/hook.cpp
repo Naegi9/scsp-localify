@@ -1,5 +1,8 @@
 #include <stdinclude.hpp>
 #include <unordered_set>
+#include <mutex>
+#include <future>
+#include <algorithm>
 #include <ranges>
 #include <set>
 #include <Psapi.h>
@@ -1745,42 +1748,218 @@ namespace
 	// Drama (Ver.2) stories: subtitles live in DramaSubtitlePlayableBehaviour.text on the timeline.
 	// When a Drama scene initializes, translate every subtitle line in place via local2.json
 	// (untranslated lines are dumped to local2.json when dumpUntransLocal2 is on).
-	// ---- Drama subtitle helpers ----
-	static int g_dramaTranslated = 0, g_dramaMissed = 0;
+	// ======================= Live translation (OpenRouter) =======================
+	// Config file: scsp_localify/live_translate.json
+	//   { "enabled": true, "apiKey": "sk-or-...", "model": "google/gemini-2.5-flash", "waitSeconds": 15 }
+	// New Drama subtitle lines are sent to the LLM when a story opens; results are added to
+	// local2.json (scsp_localify) so they are permanent and work offline afterwards.
+	static int g_liveGeneration = 0;  // bumps whenever new translations arrive
 
-	// Translate DramaSubtitlePlayableBehaviour.text in place (each behaviour object only once).
-	void translateDramaBehaviour(void* behaviour) {
-		if (!behaviour) return;
-		static std::unordered_set<void*> done;
-		if (done.find(behaviour) != done.end()) return;
-		done.insert(behaviour);
+	bool textHasJapanese(const std::wstring& s) {
+		for (const auto c : s) {
+			if ((c >= 0x3040 && c <= 0x30FF) || (c >= 0x4E00 && c <= 0x9FFF)) return true;
+		}
+		return false;
+	}
+
+	namespace LiveTL {
+		struct Config {
+			bool loaded = false;
+			bool enabled = false;
+			std::string apiKey;
+			std::string model = "google/gemini-2.5-flash";
+			int waitSeconds = 15;
+		};
+
+		Config& cfg() {
+			static Config c;
+			if (!c.loaded) {
+				c.loaded = true;
+				try {
+					std::ifstream f(g_localify_base / "live_translate.json");
+					if (f.is_open()) {
+						std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+						auto j = nlohmann::json::parse(s);
+						c.enabled = j.value("enabled", false);
+						c.apiKey = j.value("apiKey", std::string());
+						c.model = j.value("model", c.model);
+						c.waitSeconds = j.value("waitSeconds", c.waitSeconds);
+					}
+				}
+				catch (std::exception& e) {
+					printf("[LiveTL] could not read live_translate.json: %s\n", e.what());
+				}
+				if (c.enabled && c.apiKey.empty()) {
+					printf("[LiveTL] enabled but apiKey is empty - disabling\n");
+					c.enabled = false;
+				}
+				printf("[LiveTL] %s (model: %s)\n", c.enabled ? "enabled" : "disabled", c.model.c_str());
+			}
+			return c;
+		}
+
+		std::mutex mtx;
+		std::vector<std::pair<std::string, std::string>> ready;  // orig utf8 -> translation utf8
+		std::unordered_set<std::string> inFlight;
+
+		const char* kSystemPrompt = R"(You translate Japanese dialogue from THE iDOLM@STER Shiny Colors: Song for Prism into natural English.
+Input is a JSON object of id -> Japanese line. The lines are consecutive subtitles from ONE story scene, in order.
+Return ONLY a JSON object with the exact same ids -> English text. No commentary, no code fences.
+Rules:
+- Speaker names are not given; infer who is talking from context. The player character is "Producer".
+- Natural, emotionally faithful English that fits each idol's personality. Keep it concise: it is shown in a subtitle box.
+- Keep \n line breaks roughly where they are. Use ... for Japanese ellipses.
+- Keep markup exactly as-is: <...> tags and placeholders like {0}.
+- Japanese names in Western order, romanized (e.g. Mano Sakuragi). 283 Production = "283 Pro".)";
+
+		std::vector<std::string> tagsOf(const std::string& s) {
+			static const std::regex re("\\{\\d+(:[^}]*)?\\}|<[^>]+>");
+			std::vector<std::string> v;
+			for (auto it = std::sregex_iterator(s.begin(), s.end(), re); it != std::sregex_iterator(); ++it) v.push_back(it->str());
+			std::sort(v.begin(), v.end());
+			return v;
+		}
+
+		std::string postChat(const std::string& bodyUtf8) {
+			web::http::client::http_client_config hc;
+			hc.set_timeout(utility::seconds(120));
+			web::http::client::http_client client(U("https://openrouter.ai/api/v1/chat/completions"), hc);
+			web::http::http_request req(web::http::methods::POST);
+			req.headers().add(U("Authorization"), utility::conversions::to_string_t("Bearer " + cfg().apiKey));
+			req.set_body(bodyUtf8, "application/json");
+			auto resp = client.request(req).get();
+			auto text = resp.extract_utf8string(true).get();
+			if (resp.status_code() != 200) {
+				throw std::runtime_error("HTTP " + std::to_string(resp.status_code()) + ": " + text.substr(0, 300));
+			}
+			return text;
+		}
+
+		// Runs on a worker thread: no il2cpp calls here.
+		void translateBatch(const std::vector<std::string>& lines) {
+			nlohmann::json batch = nlohmann::json::object();
+			for (size_t i = 0; i < lines.size(); i++) batch[std::to_string(i)] = lines[i];
+			nlohmann::json body = {
+				{"model", cfg().model},
+				{"temperature", 0.2},
+				{"response_format", {{"type", "json_object"}}},
+				{"messages", nlohmann::json::array({
+					{{"role", "system"}, {"content", kSystemPrompt}},
+					{{"role", "user"}, {"content", batch.dump(-1, ' ', false)}}
+				})}
+			};
+			const auto bodyStr = body.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+
+			for (int attempt = 1; attempt <= 3; attempt++) {
+				try {
+					auto respJson = nlohmann::json::parse(postChat(bodyStr));
+					std::string content = respJson["choices"][0]["message"]["content"].get<std::string>();
+					const auto a = content.find('{');
+					const auto b = content.rfind('}');
+					if (a == std::string::npos || b == std::string::npos || b < a) throw std::runtime_error("no JSON object in reply");
+					auto out = nlohmann::json::parse(content.substr(a, b - a + 1));
+
+					std::vector<std::pair<std::string, std::string>> good;
+					for (size_t i = 0; i < lines.size(); i++) {
+						const auto key = std::to_string(i);
+						if (!out.contains(key) || !out[key].is_string()) continue;
+						const auto en = out[key].get<std::string>();
+						if (en.empty() || tagsOf(en) != tagsOf(lines[i])) continue;
+						good.emplace_back(lines[i], en);
+					}
+					std::lock_guard<std::mutex> lock(mtx);
+					for (const auto& l : lines) inFlight.erase(l);
+					for (auto& g : good) ready.push_back(std::move(g));
+					printf("[LiveTL] batch done: %zu/%zu lines translated\n", good.size(), lines.size());
+					return;
+				}
+				catch (std::exception& e) {
+					printf("[LiveTL] request failed (attempt %d/3): %s\n", attempt, e.what());
+					std::this_thread::sleep_for(std::chrono::seconds(2 * attempt));
+				}
+			}
+			std::lock_guard<std::mutex> lock(mtx);
+			for (const auto& l : lines) inFlight.erase(l);  // allow a retry next time the story opens
+		}
+
+		// Start translating lines in the background. Returns a future that completes when all batches finish.
+		std::shared_future<void> request(const std::vector<std::string>& linesIn) {
+			std::vector<std::string> lines;
+			{
+				std::lock_guard<std::mutex> lock(mtx);
+				for (const auto& l : linesIn) {
+					if (inFlight.insert(l).second) lines.push_back(l);
+				}
+			}
+			if (lines.empty()) return {};
+			printf("[LiveTL] translating %zu new lines with %s...\n", lines.size(), cfg().model.c_str());
+			auto task = std::make_shared<std::packaged_task<void()>>([lines]() {
+				const size_t chunk = 80;
+				for (size_t i = 0; i < lines.size(); i += chunk) {
+					translateBatch(std::vector<std::string>(lines.begin() + i, lines.begin() + std::min(lines.size(), i + chunk)));
+				}
+			});
+			std::shared_future<void> fut = task->get_future().share();
+			std::thread([task]() { (*task)(); }).detach();
+			return fut;
+		}
+
+		// Main thread: move finished translations into the dictionary + local2.json.
+		void drainReady() {
+			std::vector<std::pair<std::string, std::string>> got;
+			{
+				std::lock_guard<std::mutex> lock(mtx);
+				if (ready.empty()) return;
+				got.swap(ready);
+			}
+			SCLocal::addUnlocalTrans(got);
+			g_liveGeneration++;
+			printf("[LiveTL] %zu new lines saved to local2.json\n", got.size());
+		}
+	}
+
+	// ======================= Drama (Ver.2) subtitle translation =======================
+	static int g_dramaTranslated = 0, g_dramaMissed = 0;
+	static std::unordered_set<void*> g_dramaDone;            // behaviours already translated
+	static std::unordered_map<void*, int> g_dramaTriedGen;   // last translation generation tried per behaviour
+
+	// Translate DramaSubtitlePlayableBehaviour.text in place. Returns true when translated.
+	// On the first miss, the Japanese line is appended to missOut (if given).
+	bool translateDramaBehaviour(void* behaviour, std::vector<std::string>* missOut = nullptr) {
+		if (!behaviour) return false;
+		if (g_dramaDone.find(behaviour) != g_dramaDone.end()) return true;
+		const auto tried = g_dramaTriedGen.find(behaviour);
+		const bool firstTry = tried == g_dramaTriedGen.end();
+		if (!firstTry && tried->second == g_liveGeneration) return false;
+		g_dramaTriedGen[behaviour] = g_liveGeneration;
+
 		static auto behaviourClass = il2cpp_symbols::get_class("PRISM.Interactions.Drama.dll", "PRISM.Interactions.Drama", "DramaSubtitlePlayableBehaviour");
 		static auto textField = behaviourClass ? il2cpp_symbols_logged::il2cpp_class_get_field_from_name(behaviourClass, "text") : nullptr;
-		if (!textField) return;
+		if (!textField) return false;
 		auto text = il2cpp_symbols::read_field<Il2CppString*>(behaviour, textField);
-		if (!text) return;
+		if (!text) return false;
+		const std::wstring orig(text->start_char);
+
 		std::string newTrans("");
-		if (SCLocal::getGameUnlocalTrans(std::wstring(text->start_char), &newTrans)) {
+		const bool found = firstTry ? SCLocal::getGameUnlocalTrans(orig, &newTrans) : SCLocal::lookupUnlocalTrans(orig, &newTrans);
+		if (found) {
 			auto newStr = il2cpp_string_new(newTrans.c_str());
-			il2cpp_gchandle_new(newStr, false);  // keep the new string alive for the whole session
-			// Store the reference directly into the field slot (with GC write barrier when available).
+			il2cpp_gchandle_new(newStr, false);  // keep the new string alive
 			static const auto wbarrier = reinterpret_cast<void (*)(void*, void**, void*)>(
 				GetProcAddress(GetModuleHandleW(L"GameAssembly.dll"), "il2cpp_gc_wbarrier_set_field"));
 			auto slot = reinterpret_cast<void**>(reinterpret_cast<char*>(behaviour) + textField->offset);
 			if (wbarrier) wbarrier(behaviour, slot, newStr);
 			else *slot = newStr;
-			static int verifyPrints = 0;
-			if (verifyPrints < 3) {
-				verifyPrints++;
-				auto check = il2cpp_symbols::read_field<Il2CppString*>(behaviour, textField);
-				printf("[Drama] write check: %s, old len %d, new len %d (wbarrier %s)\n",
-					check == newStr ? "ok" : "MISMATCH", text->length, check ? check->length : -1, wbarrier ? "yes" : "no");
-			}
+			g_dramaDone.insert(behaviour);
 			g_dramaTranslated++;
+			if (!firstTry) g_dramaMissed--;
+			return true;
 		}
-		else {
+		if (firstTry) {
 			g_dramaMissed++;
+			if (missOut && textHasJapanese(orig)) missOut->push_back(utility::conversions::to_utf8string(orig));
 		}
+		return false;
 	}
 
 	// Find an instance field of type DramaSubtitlePlayableBehaviour on obj (searching base classes too).
@@ -1804,35 +1983,15 @@ namespace
 		return nullptr;
 	}
 
-	// Called by the timeline for the active subtitle clip.
+	// Called by the timeline for the active subtitle clip (main thread, every frame).
 	HOOK_ORIG_TYPE DramaSubtitleMixerBehaviour_Apply_orig;
 	void DramaSubtitleMixerBehaviour_Apply_hook(void* _this, void* clip, double time) {
-		static bool announced = false;
-		if (!announced) { announced = true; printf("[Drama] subtitle Apply hook active\n"); }
 		try {
+			LiveTL::drainReady();
 			static auto TimelineClip_get_asset = reinterpret_cast<void* (*)(void*)>(
 				il2cpp_symbols::get_method_pointer("Unity.Timeline.dll", "UnityEngine.Timeline", "TimelineClip", "get_asset", 0));
 			if (clip && TimelineClip_get_asset) {
-				const int before = g_dramaTranslated + g_dramaMissed;
-				auto behaviour = findDramaBehaviourIn(TimelineClip_get_asset(clip));
-				translateDramaBehaviour(behaviour);
-				static void* lastBehaviour = nullptr;
-				static int applyPrints = 0;
-				if (behaviour && behaviour != lastBehaviour && applyPrints < 5) {
-					lastBehaviour = behaviour;
-					applyPrints++;
-					static auto bClass = il2cpp_symbols::get_class("PRISM.Interactions.Drama.dll", "PRISM.Interactions.Drama", "DramaSubtitlePlayableBehaviour");
-					static auto tField = bClass ? il2cpp_symbols_logged::il2cpp_class_get_field_from_name(bClass, "text") : nullptr;
-					auto t = tField ? il2cpp_symbols::read_field<Il2CppString*>(behaviour, tField) : nullptr;
-					printf("[Drama] showing line: behaviour %p, text len %d\n", behaviour, t ? t->length : -1);
-				}
-				else if (!behaviour && applyPrints < 5) {
-					applyPrints++;
-					printf("[Drama] Apply: no behaviour found on clip asset\n");
-				}
-				if (g_dramaTranslated + g_dramaMissed != before) {
-					printf("[Drama] lines so far: %d translated, %d untranslated\n", g_dramaTranslated, g_dramaMissed);
-				}
+				translateDramaBehaviour(findDramaBehaviourIn(TimelineClip_get_asset(clip)));
 			}
 		}
 		catch (std::exception& e) {
@@ -1841,7 +2000,7 @@ namespace
 		HOOK_CAST_CALL(void, DramaSubtitleMixerBehaviour_Apply)(_this, clip, time);
 	}
 
-	// Scene setup: translate every subtitle line up front via the initializer result.
+	// Scene setup: translate every subtitle line up front; live-translate the missing ones.
 	HOOK_ORIG_TYPE DramaSceneHandler_Initialize_orig;
 	void DramaSceneHandler_Initialize_hook(void* _this, void* result) {
 		try {
@@ -1852,10 +2011,33 @@ namespace
 			if (result && arrField && behaviourField) {
 				auto arr = il2cpp_symbols::read_field<Il2CppArraySize*>(result, arrField);
 				if (arr) {
+					// New scene: reset per-scene state (objects from earlier scenes are gone).
+					g_dramaDone.clear();
+					g_dramaTriedGen.clear();
+					g_dramaTranslated = 0;
+					g_dramaMissed = 0;
+					LiveTL::drainReady();
+
+					std::vector<void*> behaviours;
 					for (il2cpp_array_size_t i = 0; i < arr->max_length; i++) {
-						if (arr->vector[i]) translateDramaBehaviour(il2cpp_symbols::read_field(arr->vector[i], behaviourField));
+						if (arr->vector[i]) behaviours.push_back(il2cpp_symbols::read_field(arr->vector[i], behaviourField));
 					}
-					printf("[Drama] scene start: %u subtitle lines (%d translated, %d untranslated)\n", (unsigned)arr->max_length, g_dramaTranslated, g_dramaMissed);
+					std::vector<std::string> missing;
+					for (auto b : behaviours) translateDramaBehaviour(b, &missing);
+					printf("[Drama] scene start: %zu subtitle lines (%d translated, %d untranslated)\n", behaviours.size(), g_dramaTranslated, g_dramaMissed);
+
+					if (!missing.empty() && LiveTL::cfg().enabled) {
+						auto fut = LiveTL::request(missing);
+						const int wait = LiveTL::cfg().waitSeconds;
+						if (fut.valid() && wait > 0) {
+							if (fut.wait_for(std::chrono::seconds(wait)) != std::future_status::ready) {
+								printf("[LiveTL] still working after %ds - remaining lines will switch to English as they arrive\n", wait);
+							}
+						}
+						LiveTL::drainReady();
+						for (auto b : behaviours) translateDramaBehaviour(b);
+						printf("[Drama] after live translation: %d translated, %d untranslated\n", g_dramaTranslated, g_dramaMissed);
+					}
 				}
 			}
 		}
@@ -3858,12 +4040,7 @@ namespace
 		else {
 			printf("DramaSceneHandler.Initialize not found\n");
 		}
-		if (DramaSceneOperationHandler_Initialize_addr) {
-			ADD_HOOK(DramaSceneOperationHandler_Initialize, "DramaSceneOperationHandler_Initialize at %p");
-		}
-		else {
-			printf("DramaSceneOperationHandler.Initialize not found\n");
-		}
+		// DramaSceneOperationHandler.Initialize hook disabled (never called in game v2.18; replaced by DramaSceneHandler hook)
 		if (TMP_Text_SetText_addr) {
 			ADD_HOOK(TMP_Text_SetText, "TMP_Text_SetText at %p");
 		}
@@ -3941,6 +4118,7 @@ namespace
 
 		const auto gameVersionInfo = getGameVersions();
 		wprintf(L"Plugin Loaded - Game Version: %ls, Resource Version: %ls\n", gameVersionInfo.gameVersion.c_str(), gameVersionInfo.resourceVersion.c_str());
+		LiveTL::cfg();  // load + print live translation status
 		// --- Class dump: list classes/methods related to story text, written to dumps/class_dump.txt ---
 		try {
 			std::filesystem::create_directories("dumps");
