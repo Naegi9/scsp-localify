@@ -1704,13 +1704,27 @@ namespace
 		return HOOK_CAST_CALL(void, TimelineController_SetLyric)(_this, il2cpp_string_new(newText.c_str()));
 	}
 
-	HOOK_ORIG_TYPE TMP_Text_set_text_orig;
+HOOK_ORIG_TYPE TMP_Text_set_text_orig;
 	void TMP_Text_set_text_hook(void* _this, Il2CppString* value) {
-		if (needPrintStack) {
-			//wprintf(L"TMP_Text_set_text: %ls\n", value->start_char);
-			//printf("%ls\n\n", environment_get_stacktrace()->start_char);
+		// Translate text that is set at runtime (e.g. story subtitles) via local2.json.
+		// Only Japanese text is looked up, and each missing line is dumped once per session.
+		if (value) {
+			const std::wstring orig(value->start_char);
+			bool hasJp = false;
+			for (const auto c : orig) {
+				if ((c >= 0x3040 && c <= 0x30FF) || (c >= 0x4E00 && c <= 0x9FFF)) { hasJp = true; break; }
+			}
+			static std::unordered_set<std::wstring> missingSeen;
+			if (hasJp && missingSeen.find(orig) == missingSeen.end()) {
+				std::string newTrans("");
+				if (SCLocal::getGameUnlocalTrans(orig, &newTrans)) {
+					value = il2cpp_string_new(newTrans.c_str());
+				}
+				else {
+					missingSeen.insert(orig);
+				}
+			}
 		}
-		//if(value) value = il2cpp_symbols::NewWStr(std::format(L"(h){}", std::wstring(value->start_char)));
 		HOOK_CAST_CALL(void, TMP_Text_set_text)(
 			_this, value
 			);
