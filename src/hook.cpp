@@ -3726,6 +3726,42 @@ HOOK_ORIG_TYPE TMP_Text_set_text_orig;
 
 		const auto gameVersionInfo = getGameVersions();
 		wprintf(L"Plugin Loaded - Game Version: %ls, Resource Version: %ls\n", gameVersionInfo.gameVersion.c_str(), gameVersionInfo.resourceVersion.c_str());
+		// --- Class dump: list classes/methods related to story text, written to dumps/class_dump.txt ---
+		try {
+			std::filesystem::create_directories("dumps");
+			std::ofstream out("dumps/class_dump.txt");
+			static const std::regex re("Drama|Subtitle|Telop|Caption|Serif|Message|Talk|Scenario|Story|Voice|Line", std::regex::icase);
+			size_t asmCount = 0;
+			const auto assemblies = il2cpp_domain_get_assemblies(il2cpp_domain_get(), &asmCount);
+			for (size_t a = 0; a < asmCount; a++) {
+				const auto image = il2cpp_assembly_get_image(const_cast<void*>(assemblies[a]));
+				const char* imgName = il2cpp_image_get_name(image);
+				const auto classCount = il2cpp_image_get_class_count(image);
+				for (size_t c = 0; c < classCount; c++) {
+					auto klass = const_cast<void*>(reinterpret_cast<const void*>(il2cpp_image_get_class(image, c)));
+					const char* cname = il2cpp_class_get_name(klass);
+					if (!cname || !std::regex_search(cname, re)) continue;
+					const char* ns = il2cpp_class_get_namespace(klass);
+					out << imgName << " | " << (ns ? ns : "") << "." << cname << "\n";
+					void* iter = nullptr;
+					MethodInfo* m = nullptr;
+					while ((m = il2cpp_class_get_methods(klass, &iter)) != nullptr) {
+						out << "    " << il2cpp_method_get_name(m) << "(";
+						const auto pc = il2cpp_method_get_param_count(m);
+						for (uint32_t i = 0; i < pc; i++) {
+							const char* tn = il2cpp_type_get_name(il2cpp_method_get_param(m, i));
+							out << (i ? ", " : "") << (tn ? tn : "?");
+						}
+						out << ")\n";
+					}
+				}
+			}
+			out.close();
+			printf("Class dump written to dumps/class_dump.txt\n");
+		}
+		catch (std::exception& e) {
+			printf("Class dump failed: %s\n", e.what());
+		}
 	}
 }
 
