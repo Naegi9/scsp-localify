@@ -9,4 +9,6 @@ namespace SCLocal {
 	bool getLocalFileName(const std::wstring& gamePath, std::filesystem::path* localPath, bool checkExists = true);
 	std::string getLyricsTrans(const std::wstring& orig);
 	bool getGameUnlocalTrans(const std::wstring& orig, std::string* newStr);
+	bool lookupUnlocalTrans(const std::wstring& orig, std::string* newStr);
+	void addUnlocalTrans(const std::vector<std::pair<std::string, std::string>>& items);
 }

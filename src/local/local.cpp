@@ -202,6 +202,38 @@ namespace SCLocal {
 		return lrcStr;
 	}
 
+	// Lookup without dumping (used for repeated checks every frame).
+	bool lookupUnlocalTrans(const std::wstring& orig, std::string* newStr) {
+		const auto origStr = utility::conversions::to_utf8string(orig);
+		if (auto iter = unLocalTrans.find(origStr); iter != unLocalTrans.end()) {
+			*newStr = iter->second;
+			return true;
+		}
+		return false;
+	}
+
+	// Add new translations to the in-memory dictionary and persist them to scsp_localify/local2.json.
+	void addUnlocalTrans(const std::vector<std::pair<std::string, std::string>>& items) {
+		for (const auto& [k, v] : items) unLocalTrans[k] = v;
+		try {
+			const auto path = g_localify_base / "local2.json";
+			nlohmann::ordered_json data = nlohmann::ordered_json::object();
+			if (std::filesystem::exists(path)) {
+				std::ifstream in(path);
+				std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+				in.close();
+				if (!content.empty()) data = nlohmann::ordered_json::parse(content);
+			}
+			for (const auto& [k, v] : items) data[k] = v;
+			std::ofstream out(path, std::ofstream::out);
+			out << data.dump(4, ' ', false, nlohmann::ordered_json::error_handler_t::replace);
+			out.close();
+		}
+		catch (std::exception& e) {
+			printf("Save local2.json failed: %s\n", e.what());
+		}
+	}
+
 	bool getGameUnlocalTrans(const std::wstring& orig, std::string* newStr) {
 		// const auto origStr = replaceAll(replaceAll(utility::conversions::to_utf8string(orig), "\n", "\\n"), "\r", "\\r");
 		const auto origStr = utility::conversions::to_utf8string(orig);
