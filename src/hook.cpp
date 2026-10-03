@@ -2172,8 +2172,12 @@ Rules:
 			// wprintf(L"UITextMeshProUGUI_Awake: %ls\n", origText->start_char);
 			if (!get_NeedsLocalization_func(_this)) {
 				std::string newTrans("");
-				if (SCLocal::getGameUnlocalTrans(std::wstring(origText->start_char), &newTrans)) {
+				const std::wstring origW(origText->start_char);
+				if (SCLocal::getGameUnlocalTrans(origW, &newTrans)) {
 					set_Text(_this, il2cpp_string_new(newTrans.c_str()));
+				}
+				else if (textHasJapanese(origW)) {
+					LiveTL::queueUI(utility::conversions::to_utf8string(origW));  // static text baked into screens/popups
 				}
 			}
 			else {
