@@ -1726,6 +1726,7 @@ namespace
 			bool loaded = false;
 			bool enabled = false;
 			std::string apiKey;
+			std::string endpoint = "https://openrouter.ai/api/v1/chat/completions";
 			std::string model = "google/gemini-2.5-flash";
 			int waitSeconds = 15;
 			bool translateUI = true;
@@ -1742,6 +1743,7 @@ namespace
 						auto j = nlohmann::json::parse(s);
 						c.enabled = j.value("enabled", false);
 						c.apiKey = j.value("apiKey", std::string());
+						c.endpoint = j.value("endpoint", c.endpoint);
 						c.model = j.value("model", c.model);
 						c.waitSeconds = j.value("waitSeconds", c.waitSeconds);
 						c.translateUI = j.value("translateUI", c.translateUI);
@@ -1750,11 +1752,12 @@ namespace
 				catch (std::exception& e) {
 					printf("[LiveTL] could not read live_translate.json: %s\n", e.what());
 				}
-				if (c.enabled && c.apiKey.empty()) {
+				const bool localEndpoint = c.endpoint.find("127.0.0.1") != std::string::npos || c.endpoint.find("localhost") != std::string::npos;
+				if (c.enabled && c.apiKey.empty() && !localEndpoint) {
 					printf("[LiveTL] enabled but apiKey is empty - disabling\n");
 					c.enabled = false;
 				}
-				printf("[LiveTL] %s (model: %s, UI text: %s)\n", c.enabled ? "enabled" : "disabled", c.model.c_str(), c.translateUI ? "on" : "off");
+				printf("[LiveTL] %s (model: %s, UI text: %s, endpoint: %s)\n", c.enabled ? "enabled" : "disabled", c.model.c_str(), c.translateUI ? "on" : "off", c.endpoint.c_str());
 			}
 			return c;
 		}
@@ -1793,10 +1796,12 @@ Rules:
 
 		std::string postChat(const std::string& bodyUtf8) {
 			web::http::client::http_client_config hc;
-			hc.set_timeout(utility::seconds(120));
-			web::http::client::http_client client(U("https://openrouter.ai/api/v1/chat/completions"), hc);
+			hc.set_timeout(utility::seconds(300));  // Claude via the local bridge can take a while for long scenes
+			web::http::client::http_client client(utility::conversions::to_string_t(cfg().endpoint), hc);
 			web::http::http_request req(web::http::methods::POST);
-			req.headers().add(U("Authorization"), utility::conversions::to_string_t("Bearer " + cfg().apiKey));
+			if (!cfg().apiKey.empty()) {
+				req.headers().add(U("Authorization"), utility::conversions::to_string_t("Bearer " + cfg().apiKey));
+			}
 			req.set_body(bodyUtf8, "application/json");
 			auto resp = client.request(req).get();
 			auto text = resp.extract_utf8string(true).get();
