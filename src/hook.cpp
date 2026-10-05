@@ -1812,7 +1812,8 @@ Rules:
 		}
 
 		// Runs on a worker thread: no il2cpp calls here.
-		void translateBatch(const std::vector<std::string>& lines, bool ui) {
+		// Sends one batch and fills `good` with (orig, translation). Returns false if every attempt failed.
+		bool translateChunk(const std::vector<std::string>& lines, const char* prompt, std::vector<std::pair<std::string, std::string>>& good) {
 			nlohmann::json batch = nlohmann::json::object();
 			for (size_t i = 0; i < lines.size(); i++) batch[std::to_string(i)] = lines[i];
 			nlohmann::json body = {
@@ -1820,8 +1821,8 @@ Rules:
 				{"temperature", 0.2},
 				{"response_format", {{"type", "json_object"}}},
 				{"messages", nlohmann::json::array({
-					{{"role", "system"}, {"content", ui ? kUIPrompt : kSystemPrompt}},
-					{{"role", "user"}, {"content", batch.dump(-1, ' ', false)}}
+					{{"role", "system"}, {"content", prompt}},
+					{{"role", "user"}, {"content", batch.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace)}}
 				})}
 			};
 			const auto bodyStr = body.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
@@ -1834,8 +1835,7 @@ Rules:
 					const auto b = content.rfind('}');
 					if (a == std::string::npos || b == std::string::npos || b < a) throw std::runtime_error("no JSON object in reply");
 					auto out = nlohmann::json::parse(content.substr(a, b - a + 1));
-
-					std::vector<std::pair<std::string, std::string>> good;
+					good.clear();
 					for (size_t i = 0; i < lines.size(); i++) {
 						const auto key = std::to_string(i);
 						if (!out.contains(key) || !out[key].is_string()) continue;
@@ -1843,19 +1843,24 @@ Rules:
 						if (en.empty() || tagsOf(en) != tagsOf(lines[i])) continue;
 						good.emplace_back(lines[i], en);
 					}
-					std::lock_guard<std::mutex> lock(mtx);
-					for (const auto& l : lines) inFlight.erase(l);
-					for (auto& g : good) ready.push_back(std::move(g));
-					printf("[LiveTL] batch done: %zu/%zu lines translated\n", good.size(), lines.size());
-					return;
+					return true;
 				}
 				catch (std::exception& e) {
 					printf("[LiveTL] request failed (attempt %d/3): %s\n", attempt, e.what());
 					std::this_thread::sleep_for(std::chrono::seconds(2 * attempt));
 				}
 			}
+			return false;
+		}
+
+		void translateBatch(const std::vector<std::string>& lines, bool ui) {
+			std::vector<std::pair<std::string, std::string>> good;
+			const bool ok = translateChunk(lines, ui ? kUIPrompt : kSystemPrompt, good);
 			std::lock_guard<std::mutex> lock(mtx);
-			for (const auto& l : lines) inFlight.erase(l);  // allow a retry next time the story opens
+			for (const auto& l : lines) inFlight.erase(l);  // failed lines can be retried next time
+			if (!ok) return;
+			for (auto& g : good) ready.push_back(std::move(g));
+			printf("[LiveTL] batch done: %zu/%zu lines translated\n", good.size(), lines.size());
 		}
 
 		// Start translating lines in the background. Returns a future that completes when all batches finish.
@@ -1878,6 +1883,159 @@ Rules:
 			std::shared_future<void> fut = task->get_future().share();
 			std::thread([task]() { (*task)(); }).detach();
 			return fut;
+		}
+
+		// ---- Old 3D/ADV story scripts (sXX_NNNNNNNN_NN.json) ----
+		// The whole file is translated and saved to scsp_localify/scenario/..., the same place the
+		// translation script writes to, so the plugin's normal file replacement picks it up from then on.
+		const char* kScenarioPrompt = R"(You translate Japanese dialogue from THE iDOLM@STER Shiny Colors: Song for Prism into natural English.
+Input is a JSON object of id -> Japanese text. The lines are consecutive lines from ONE story scene, in order (dialogue, monologue, and sometimes speaker names or choices).
+Return ONLY a JSON object with the exact same ids -> English text. No commentary, no code fences.
+Rules:
+- Speaker names are mostly not given; infer who is talking from context. The player character is "Producer".
+- Natural, emotionally faithful English that fits each idol's personality. Keep it concise: it is shown in a text box with 2-3 lines.
+- Keep \n line breaks roughly where they are. Use ... for Japanese ellipses.
+- Keep markup exactly as-is: <...> tags and placeholders like {0}. Never add < > or { } that are not in the source.
+- Japanese names in Western order, romanized (e.g. Mano Sakuragi). 283 Production = "283 Pro".)";
+
+		bool utf8HasJapanese(const std::string& s) {
+			return textHasJapanese(utility::conversions::to_string_t(s));
+		}
+
+		// Game files can contain raw control characters inside strings and a trailing ",]".
+		std::string cleanScenarioJson(const std::string& in) {
+			std::string out;
+			out.reserve(in.size() + 64);
+			bool inStr = false, esc = false;
+			for (const char c : in) {
+				if (inStr) {
+					if (esc) { esc = false; out += c; continue; }
+					if (c == '\\') { esc = true; out += c; continue; }
+					if (c == '"') { inStr = false; out += c; continue; }
+					if (c == '\r') { out += "\\r"; continue; }
+					if (c == '\n') { out += "\\n"; continue; }
+					if (c == '\t') { out += "\\t"; continue; }
+					out += c;
+				}
+				else {
+					if (c == '"') inStr = true;
+					out += c;
+				}
+			}
+			static const std::regex trailing(",\\s*\\]\\s*$");
+			return std::regex_replace(out, trailing, "]");
+		}
+
+		// Worker thread: no il2cpp calls. Returns true when the translated file was written.
+		bool translateScenarioFile(const std::string& name, const std::string& jsonUtf8, const std::filesystem::path& outFile) {
+			nlohmann::json lines;
+			try {
+				lines = nlohmann::json::parse(cleanScenarioJson(jsonUtf8));
+			}
+			catch (std::exception& e) {
+				printf("[Story] %s: could not parse (%s)\n", name.c_str(), e.what());
+				return false;
+			}
+			if (!lines.is_array()) return false;
+
+			std::vector<std::string> todo;
+			std::unordered_set<std::string> seen;
+			for (const auto& e : lines) {
+				if (!e.is_object() || !e.contains("text") || !e["text"].is_string()) continue;
+				const auto t = e["text"].get<std::string>();
+				if (utf8HasJapanese(t) && seen.insert(t).second) todo.push_back(t);
+			}
+			if (todo.empty()) return false;
+			printf("[Story] %s: translating %zu lines with %s...\n", name.c_str(), todo.size(), cfg().model.c_str());
+
+			// Send the chunks in parallel (the bridge handles several requests at once).
+			const size_t chunk = 80;
+			std::vector<std::future<std::pair<bool, std::vector<std::pair<std::string, std::string>>>>> jobs;
+			for (size_t i = 0; i < todo.size(); i += chunk) {
+				std::vector<std::string> part(todo.begin() + i, todo.begin() + std::min(todo.size(), i + chunk));
+				jobs.push_back(std::async(std::launch::async, [part]() {
+					std::vector<std::pair<std::string, std::string>> good;
+					const bool ok = translateChunk(part, kScenarioPrompt, good);
+					return std::make_pair(ok, good);
+				}));
+			}
+			std::unordered_map<std::string, std::string> tl;
+			bool allOk = true;
+			for (auto& j : jobs) {
+				auto r = j.get();
+				if (!r.first) allOk = false;
+				for (auto& g : r.second) tl[g.first] = g.second;
+			}
+			if (!allOk) {
+				printf("[Story] %s: translation failed, keeping Japanese (will retry next time it opens)\n", name.c_str());
+				return false;
+			}
+
+			size_t missing = 0;
+			for (auto& e : lines) {
+				if (!e.is_object() || !e.contains("text") || !e["text"].is_string()) continue;
+				const auto it = tl.find(e["text"].get<std::string>());
+				if (it != tl.end()) e["text"] = it->second;
+				else if (utf8HasJapanese(e["text"].get<std::string>())) missing++;
+			}
+			try {
+				std::filesystem::create_directories(outFile.parent_path());
+				auto tmp = outFile;
+				tmp += L".tmp";
+				{
+					std::ofstream f(tmp, std::ios::binary);
+					f << lines.dump(4, ' ', false, nlohmann::json::error_handler_t::replace);
+				}
+				std::filesystem::rename(tmp, outFile);
+			}
+			catch (std::exception& e) {
+				printf("[Story] %s: could not save (%s)\n", name.c_str(), e.what());
+				return false;
+			}
+			printf("[Story] %s: saved translation (%zu lines%s)\n", name.c_str(), todo.size(),
+				missing ? (", " + std::to_string(missing) + " left in Japanese").c_str() : "");
+			return true;
+		}
+
+		std::mutex scenarioMtx;
+		std::unordered_map<std::wstring, std::shared_future<bool>> scenarioJobs;
+
+		// Main thread. Starts (or joins) the translation of a story file and waits up to waitSeconds.
+		// Returns true if the translated file is ready to be loaded now.
+		bool scenarioLive(const std::wstring& name, void* origBytes, const std::filesystem::path& outFile) {
+			static const std::wregex storyRe(L"^s\\d+_\\d+_\\d+\\.json$", std::regex::icase);
+			if (!cfg().enabled || !std::regex_match(name, storyRe)) return false;
+
+			std::shared_future<bool> fut;
+			{
+				std::lock_guard<std::mutex> lock(scenarioMtx);
+				auto it = scenarioJobs.find(name);
+				if (it != scenarioJobs.end()) {
+					fut = it->second;  // already translating (e.g. a timed-out earlier open)
+				}
+				else {
+					auto str = bytesToIl2cppString(origBytes);
+					if (!str) return false;
+					const std::string jsonUtf8 = utility::conversions::to_utf8string(std::wstring(str->start_char));
+					if (!utf8HasJapanese(jsonUtf8)) return false;
+					const std::string nameUtf8 = utility::conversions::to_utf8string(name);
+					fut = std::async(std::launch::async, [nameUtf8, jsonUtf8, outFile]() {
+						return translateScenarioFile(nameUtf8, jsonUtf8, outFile);
+					}).share();
+					scenarioJobs[name] = fut;
+				}
+			}
+
+			printf("[Story] waiting up to %ds for the translation...\n", cfg().waitSeconds);
+			if (fut.wait_for(std::chrono::seconds(cfg().waitSeconds)) != std::future_status::ready) {
+				printf("[Story] not done yet - showing Japanese this time; the translation is saved when it finishes, reopen the story then\n");
+				return false;
+			}
+			{
+				std::lock_guard<std::mutex> lock(scenarioMtx);
+				scenarioJobs.erase(name);  // finished: a failed one may be retried on the next open
+			}
+			return fut.get() && std::filesystem::exists(outFile);
 		}
 
 		// Main thread: move finished translations into the dictionary + local2.json.
@@ -2266,6 +2424,20 @@ Rules:
 				fileDump << utility::conversions::to_utf8string(writeWstr).c_str();
 				fileDump.close();
 				printf("Auto dump: %ls\n", fileName.c_str());
+			}
+		}
+
+		// Old 3D/ADV story with no translation yet: translate it live and load the result.
+		if (ret) {
+			try {
+				const auto outFile = g_localify_base / SCLocal::getFilePathByName(pathStr, false, g_localify_base);
+				if (LiveTL::scenarioLive(pathStr, ret, outFile)) {
+					printf("[Story] loaded translated %ls\n", pathStr.c_str());
+					return readFileAllBytes(outFile);
+				}
+			}
+			catch (std::exception& e) {
+				printf("[Story] live translation error: %s\n", e.what());
 			}
 		}
 		return ret;
